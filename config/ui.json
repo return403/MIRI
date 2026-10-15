@@ -1,0 +1,45 @@
+{
+  "devices": {
+    "master_port": "/dev/ttyUSB0",
+    "modules": [
+      {
+        "port": "/dev/ttyUSB1",
+        "axis": 0
+      }
+    ]
+  },
+  "scope": {
+    "resource": "USB0::0xF4EC::0xEE38::SDSMMFCC6R2573::INSTR",
+    "timeout_ms": 30000,
+    "channel": 1,
+    "apply": true,
+    "vdiv": 1.5,
+    "offset": 0.0,
+    "tdiv": 0.00019999999999999998,
+    "trdl": 0.0,
+    "trig_level": 1.5,
+    "trig_slope": "POS",
+    "trig_coupling": "DC",
+    "trig_wait": 10.0,
+    "chunk_points": 1000000,
+    "save_single": false
+  },
+  "run": {
+    "settle_s": 0.5,
+    "repeats": 1,
+    "move_timeout_s": 60.0,
+    "laser": false,
+    "skip_no_trigger": false,
+    "return_home": false,
+    "record": true,
+    "out_dir": "/home/user/Dokumente/Projektarbeit/MIRI/messungen",
+    "prefix": "lauf",
+    "save_npz": true,
+    "save_csv": false,
+    "save_png": true,
+    "png_dpi": 150,
+    "positions_text": {
+      "0": ""
+    }
+  }
+}
