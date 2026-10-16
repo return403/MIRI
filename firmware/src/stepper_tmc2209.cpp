@@ -81,10 +81,21 @@ void StepperTMC2209::configureDriver() {
     driver.pdn_disable(true);
     driver.mstep_reg_select(true);
     driver.I_scale_analog(false);
-    driver.toff(5);
-    // SpreadCycle statt StealthChop: lauter, aber kein Stehenbleiben beim Anfahren
-    // (StealthChop braucht eine Selbstabstimmung und reisst bei wenig Strom leicht ab).
-    driver.en_spreadCycle(true);
+    // Chopper wie Klipper/Marlin: TOFF 3, HSTRT 5, HEND 0 (Rohwerte), Blank-Zeit TBL 2.
+    // Mit TBL 0 (16 Takte, Werkswert) haelt SpreadCycle Schaltspitzen fuer "Strom erreicht",
+    // der Strom baut sich nie auf (Open Load auf beiden Spulen), der Motor pfeift und steht.
+    driver.toff(3);
+    driver.hstrt(5);
+    driver.hend(0);
+    driver.tbl(2);
+    // StealthChop fuer ruhigen Lauf, bei jeder Geschwindigkeit (TPWMTHRS 0, kein Wechsel
+    // zu SpreadCycle). Die Selbstabstimmung braucht nach dem Enable kurz Stillstand unter
+    // Strom und lernt bei den ersten Fahrten nach. Bleibt der Motor beim Anfahren stehen:
+    // Strom erhoehen, Beschleunigung senken oder zurueck auf SpreadCycle.
+    driver.en_spreadCycle(false);
+    driver.pwm_autoscale(true);
+    driver.pwm_autograd(true);
+    driver.TPWMTHRS(0);
     driver.rms_current(config.rmsCurrentMa);
     driver.microsteps(config.microsteps);
     driver.GSTAT(0x07);         // reset, drv_err, uv_cp quittieren

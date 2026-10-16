@@ -1,0 +1,255 @@
+// Motortest fuer das Achsmodul (Nano + TMC2209), unabhaengig von der eigentlichen Firmware.
+//
+// Stellt den Treiber per UART ein, liest die Register zur Kontrolle zurueck und faehrt dann
+// mit festem Takt aus einer Warteschleife (kein AccelStepper, kein Encoder, kein Protokoll):
+// je Geschwindigkeit eine Umdrehung vor und zurueck. Ausgabe im seriellen Monitor, 115200 Baud.
+//
+//   pio run -e motor_test -t upload && pio device monitor
+//
+// Laeuft der Motor hier sauber, liegt ein Ruckeln an der Firmware. Ruckelt er auch hier,
+// liegt es an Verdrahtung, Netzteil oder Treiber.
+
+#include <Arduino.h>
+#include <TMCStepper.h>
+#include "../pins.h"
+
+static const uint16_t CURRENT_MA = 600;
+static const uint16_t MICROSTEPS = 16;
+static const uint32_t STEPS_PER_REV = 200UL * MICROSTEPS;
+static const float SPEEDS_REV_PER_SEC[] = {0.25f, 0.5f, 1.0f};
+
+static TMC2209Stepper driver(PIN_TMC_RX[0], PIN_TMC_TX[0], TMC_RSENSE, TMC_DRIVER_ADDRESS[0]);
+
+static void printHex(const char *name, uint32_t value) {
+    Serial.print(name);
+    Serial.print(F(" = 0x"));
+    Serial.println(value, HEX);
+}
+
+static void configureDriver() {
+    driver.beginSerial(19200);
+    driver.pdn_disable(true);
+    driver.mstep_reg_select(true);
+    driver.I_scale_analog(false);
+    // Chopper wie Klipper/Marlin: TOFF 3, HSTRT 5, HEND 0 (Rohwerte), Blank-Zeit TBL 2.
+    // Mit TBL 0 (16 Takte, Werkswert) haelt SpreadCycle Schaltspitzen fuer "Strom erreicht",
+    // der Strom baut sich nie auf (Open Load auf beiden Spulen), der Motor pfeift und steht.
+    driver.toff(3);
+    driver.hstrt(5);
+    driver.hend(0);
+    driver.tbl(2);
+    driver.en_spreadCycle(true);
+    driver.rms_current(CURRENT_MA);
+    driver.microsteps(MICROSTEPS);
+    driver.GSTAT(0x07);         // Reset-Bit quittieren, taucht es wieder auf: Treiber neu gestartet
+}
+
+static void reportDriver() {
+    uint8_t connection = driver.test_connection();
+    Serial.print(F("UART-Verbindung: "));
+    if (connection == 0) {
+        Serial.println(F("ok"));
+    } else {
+        Serial.print(F("FEHLER "));
+        Serial.println(connection);     // 1: Leitung offen (0xFFFFFFFF), 2: nur Nullen
+    }
+    printHex("Chipversion (soll 0x21)", driver.version());
+    Serial.print(F("Mikroschritte gelesen: "));
+    Serial.println(driver.microsteps());
+    Serial.print(F("SpreadCycle gelesen: "));
+    Serial.println(driver.en_spreadCycle() ? F("ja") : F("nein"));
+    Serial.print(F("Strom gesetzt [mA]: "));
+    Serial.println(driver.rms_current());
+    Serial.print(F("Stromskala CS: "));
+    Serial.println(driver.cs_actual());
+    printHex("CHOPCONF", driver.CHOPCONF());
+    printHex("GSTAT", driver.GSTAT());
+    printHex("DRV_STATUS", driver.DRV_STATUS());
+}
+
+// Feste Schrittfolge, Takt nur durch delayMicroseconds bestimmt.
+static void turn(bool forward, uint32_t steps, uint32_t intervalUs) {
+    digitalWrite(PIN_DIR[0], forward ? HIGH : LOW);
+    delayMicroseconds(20);
+    for (uint32_t i = 0; i < steps; i++) {
+        digitalWrite(PIN_STEP[0], HIGH);
+        delayMicroseconds(4);
+        digitalWrite(PIN_STEP[0], LOW);
+        if (intervalUs > 16383) {
+            delay(intervalUs / 1000);
+        } else {
+            delayMicroseconds(intervalUs - 4);
+        }
+    }
+}
+
+// Kommen STEP und DIR am Treiber an? Der Mikroschrittzaehler MSCNT (0..1023) zaehlt jeden
+// empfangenen Schritt um 1024 / (4 * Mikroschritte) weiter, bei 16 Mikroschritten um 16.
+static void probeSteps(bool forward, uint8_t steps) {
+    int16_t before = driver.MSCNT();
+    turn(forward, steps, 2000);
+    delay(20);
+    int16_t after = driver.MSCNT();
+    int16_t delta = after - before;
+    if (delta > 512) {
+        delta -= 1024;
+    } else if (delta < -512) {
+        delta += 1024;
+    }
+    Serial.print(forward ? F("Probe vor ") : F("Probe zurueck "));
+    Serial.print(steps);
+    Serial.print(F(" Schritte: MSCNT ") );
+    Serial.print(before);
+    Serial.print(F(" -> "));
+    Serial.print(after);
+    Serial.print(F(", Aenderung "));
+    Serial.print(delta);
+    Serial.print(F(" (erwartet "));
+    Serial.print(forward ? '+' : '-');
+    Serial.print(steps * (1024 / (4 * MICROSTEPS)));
+    Serial.println(F(")"));
+}
+
+// Welcher Nano-Pin haengt wirklich an STEP und DIR? Jeder Kandidat bekommt 4 langsame
+// Impulse, danach wird MSCNT verglichen (ohne Interpolation: genau 16 je Schritt).
+// Ausgelassen: D0/D1 (USB), D7 (EN), D10/D11 (UART), A4/A5 (I2C).
+static const uint8_t SCAN_PINS[] = {2, 3, 4, 5, 6, 8, 9, 12, 13};
+static const uint8_t SCAN_PULSES = 4;
+
+static int16_t wrapDelta(int16_t delta) {
+    if (delta > 512) {
+        delta -= 1024;
+    } else if (delta < -512) {
+        delta += 1024;
+    }
+    return delta;
+}
+
+static int16_t pulseAndMeasure(uint8_t pin) {
+    int16_t before = driver.MSCNT();
+    for (uint8_t i = 0; i < SCAN_PULSES; i++) {
+        digitalWrite(pin, HIGH);
+        delayMicroseconds(10);
+        digitalWrite(pin, LOW);
+        delay(5);
+    }
+    delay(50);
+    return wrapDelta(driver.MSCNT() - before);
+}
+
+static void scanPins() {
+    const int16_t expected = SCAN_PULSES * (1024 / (4 * MICROSTEPS));
+    Serial.println(F("\nPin-Suche STEP (je 4 Impulse, STEP-Pin zeigt +/-64):"));
+    driver.intpol(false);
+    for (uint8_t i = 0; i < sizeof(SCAN_PINS); i++) {
+        pinMode(SCAN_PINS[i], OUTPUT);
+        digitalWrite(SCAN_PINS[i], LOW);
+    }
+    delay(100);
+
+    int8_t stepPin = -1;
+    for (uint8_t i = 0; i < sizeof(SCAN_PINS); i++) {
+        int16_t d = pulseAndMeasure(SCAN_PINS[i]);
+        Serial.print(F("  D"));
+        Serial.print(SCAN_PINS[i]);
+        Serial.print(F(": "));
+        Serial.println(d);
+        if (abs(d) == expected && stepPin < 0) {
+            stepPin = SCAN_PINS[i];
+        }
+    }
+
+    if (stepPin < 0) {
+        Serial.println(F("=> KEIN Nano-Pin erreicht den STEP-Eingang des Treibers."));
+        Serial.println(F("   STEP-Draht steckt am Modul nicht auf STEP (z. B. auf CLK) oder hat keinen Kontakt."));
+    } else {
+        Serial.print(F("=> STEP haengt an D"));
+        Serial.println(stepPin);
+        int8_t dirPin = -1;
+        for (uint8_t i = 0; i < sizeof(SCAN_PINS); i++) {
+            uint8_t p = SCAN_PINS[i];
+            if (p == stepPin) {
+                continue;
+            }
+            digitalWrite(p, LOW);
+            int16_t low = pulseAndMeasure(stepPin);
+            digitalWrite(p, HIGH);
+            int16_t high = pulseAndMeasure(stepPin);
+            digitalWrite(p, LOW);
+            if ((low > 0) != (high > 0)) {
+                dirPin = p;
+                break;
+            }
+        }
+        if (dirPin < 0) {
+            Serial.println(F("=> KEIN Nano-Pin aendert die Richtung (DIR ohne Kontakt?)"));
+        } else {
+            Serial.print(F("=> DIR haengt an D"));
+            Serial.println(dirPin);
+        }
+    }
+
+    for (uint8_t i = 0; i < sizeof(SCAN_PINS); i++) {
+        uint8_t p = SCAN_PINS[i];
+        if (p != PIN_STEP[0] && p != PIN_DIR[0]) {
+            pinMode(p, INPUT);
+        }
+    }
+    driver.intpol(true);
+}
+
+void setup() {
+    pinMode(PIN_STEPPER_EN[0], OUTPUT);
+    digitalWrite(PIN_STEPPER_EN[0], HIGH);     // Treiber aus, bis er eingestellt ist
+    pinMode(PIN_STEP[0], OUTPUT);
+    pinMode(PIN_DIR[0], OUTPUT);
+    digitalWrite(PIN_STEP[0], LOW);
+
+    Serial.begin(115200);
+    delay(500);
+    Serial.println(F("\n=== MIRI Motortest ==="));
+
+    configureDriver();
+    reportDriver();
+
+    digitalWrite(PIN_STEPPER_EN[0], LOW);
+    delay(200);
+
+    Serial.println(F("\nSchritt-Probe (0 = STEP kommt nicht an, gleiches Vorzeichen = DIR kommt nicht an):"));
+    probeSteps(true, 8);
+    probeSteps(false, 8);
+    scanPins();
+}
+
+void loop() {
+    static bool spread = true;
+    driver.en_spreadCycle(spread);
+    Serial.print(F("\n##### "));
+    Serial.println(spread ? F("SpreadCycle") : F("StealthChop"));
+    spread = !spread;
+    delay(300);         // StealthChop stimmt sich im Stillstand ab
+
+    for (uint8_t i = 0; i < sizeof(SPEEDS_REV_PER_SEC) / sizeof(SPEEDS_REV_PER_SEC[0]); i++) {
+        float rps = SPEEDS_REV_PER_SEC[i];
+        uint32_t intervalUs = (uint32_t)(1000000.0f / (rps * STEPS_PER_REV));
+        Serial.print(F("\n"));
+        Serial.print(rps);
+        Serial.println(F(" U/s: eine Umdrehung vor, eine zurueck"));
+        turn(true, STEPS_PER_REV, intervalUs);
+        delay(500);
+        turn(false, STEPS_PER_REV, intervalUs);
+        delay(500);
+        printHex("DRV_STATUS", driver.DRV_STATUS());
+        uint8_t gstat = driver.GSTAT();
+        if (gstat & 0x01) {
+            Serial.println(F("!!! Treiber hat neu gestartet (Spannung an VM eingebrochen?), "
+                             "Einstellungen verloren -> neu schreiben"));
+            configureDriver();
+            reportDriver();
+        } else if (gstat & 0x06) {
+            printHex("!!! GSTAT Fehler (2 = drv_err, 4 = Unterspannung)", gstat);
+            driver.GSTAT(0x07);
+        }
+    }
+    delay(1500);
+}

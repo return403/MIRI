@@ -50,6 +50,8 @@ static_assert(sizeof(PIN_MODULE_TX) == AXIS_COUNT, "PIN_MODULE_TX: Eintrag je Ac
 // Fest vorgegeben: D0/D1 = USB-Serial bzw. RX/TX zur NodeMCU, A4/A5 = I2C (AS5600).
 static const uint8_t PIN_STATUS_LED = 13;
 
+// Vertauscht gegenueber der ersten Annahme: die Schritt-Probe im Motortest hat gezeigt,
+// dass D9 am STEP-Eingang des Treibers haengt und D8 an DIR.
 static const uint8_t PIN_STEP[]            = {9};
 static const uint8_t PIN_DIR[]             = {8};
 static const uint8_t PIN_STEPPER_EN[]      = {7};
